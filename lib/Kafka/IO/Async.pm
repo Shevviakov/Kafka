@@ -1,12 +1,13 @@
-package Kafka::IO;
+package Kafka::IO::Async;
 
 =head1 NAME
 
-Kafka::IO - Interface to network communication with the Apache Kafka server.
+Kafka::IO::Async - Pseudo async interface to nonblocking network communication with the Apache Kafka server with Coro.
+This module implemets the same interface that usual Kafka::IO module
 
 =head1 VERSION
 
-This documentation refers to C<Kafka::IO> version 1.07 .
+Read documentation for C<Kafka::IO> version 1.07 .
 
 =cut
 
@@ -20,65 +21,19 @@ use warnings;
 
 our $DEBUG = 0;
 
-our $VERSION = '1.07';
-
+our $VERSION = '1.0';
 
 
 use Carp;
 use Config;
 use Const::Fast;
-use Data::Validate::Domain qw(
-    is_hostname
-);
-use Data::Validate::IP qw(
-    is_ipv4
-    is_ipv6
-);
-use Errno qw(
-    EAGAIN
-    ECONNRESET
-    EINTR
-    EWOULDBLOCK
-    ETIMEDOUT
-);
 use Fcntl;
-use IO::Select;
 use Params::Util qw(
     _STRING
-);
-use POSIX qw(
-    ceil
 );
 use Scalar::Util qw(
     dualvar
 );
-use Socket qw(
-    AF_INET
-    AF_INET6
-    IPPROTO_TCP
-    MSG_DONTWAIT
-    MSG_PEEK
-    NI_NUMERICHOST
-    NIx_NOSERV
-    PF_INET
-    PF_INET6
-    SOCK_STREAM
-    SOL_SOCKET
-    SO_ERROR
-    SO_RCVTIMEO
-    SO_SNDTIMEO
-    getaddrinfo
-    getnameinfo
-    inet_aton
-    inet_pton
-    inet_ntop
-    pack_sockaddr_in
-    pack_sockaddr_in6
-);
-use Sys::SigAction qw(
-    set_sig_handler
-);
-use Time::HiRes ();
 use Try::Tiny;
 
 use Kafka qw(
@@ -100,6 +55,8 @@ use Kafka::Internals qw(
     format_message
 );
 
+use AnyEvent::Handle;
+
 
 
 =head1 SYNOPSIS
@@ -113,11 +70,11 @@ use Kafka::Internals qw(
     );
     use Try::Tiny;
 
-    use Kafka::IO;
+    use Kafka::IO::Async;
 
     my $io;
     try {
-        $io = Kafka::IO->new( host => 'localhost' );
+        $io = Kafka::IO::Async->new( host => 'localhost' );
     } catch {
         my $error = $_;
         if ( blessed( $error ) && $error->isa( 'Kafka::Exception' ) ) {
@@ -139,7 +96,7 @@ This module is private and should not be used directly.
 In order to achieve better performance, methods of this module do not
 perform arguments validation.
 
-The main features of the C<Kafka::IO> class are:
+The main features of the C<Kafka::IO::Async> class are:
 
 =over 3
 
@@ -155,9 +112,6 @@ This class allows you to create Kafka 0.9+ clients.
 
 =cut
 
-# Hard limit of IO operation retry attempts, to prevent high CPU usage in IO retry loop
-const my $MAX_RETRIES => 30;
-
 our $_hdr;
 
 #-- constructor ----------------------------------------------------------------
@@ -166,7 +120,7 @@ our $_hdr;
 
 =head3 C<new>
 
-Establishes TCP connection to given host and port, creates and returns C<Kafka::IO> IO object.
+Establishes TCP connection to given host and port, creates and returns C<Kafka::IO::Async> IO object.
 
 C<new()> takes arguments in key-value pairs. The following arguments are currently recognized:
 
@@ -249,7 +203,7 @@ sub new {
         $error = $_;
     };
 
-    $self->_error( $ERROR_CANNOT_BIND, format_message("Kafka::IO(%s:%s)->new: %s", $self->{host}, $self->{port}, $error ) )
+    $self->_error( $ERROR_CANNOT_BIND, format_message("Kafka::IO::Async(%s:%s)->new: %s", $self->{host}, $self->{port}, $error ) )
         if defined $error
     ;
     return $self;
@@ -259,7 +213,7 @@ sub new {
 
 =head2 METHODS
 
-The following methods are provided by C<Kafka::IO> class:
+The following methods are provided by C<Kafka::IO::Async> class:
 
 =cut
 
@@ -284,104 +238,31 @@ sub send {
         unless $length <= $MAX_SOCKET_REQUEST_BYTES
     ;
     $timeout = $self->{timeout} // $REQUEST_TIMEOUT unless defined $timeout;
-    $self->_error( $ERROR_MISMATCH_ARGUMENT, '->receive' )
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, '->send' )
         unless $timeout > 0
     ;
-    my $select = $self->{_io_select};
-    $self->_error( $ERROR_NO_CONNECTION, 'Attempt to work with a closed socket' ) unless $select;
 
-    $self->_debug_msg( $message, 'Request to', 'green' )
-        if $self->debug_level >= 2
-    ;
-    my $sent = 0;
+    my $socket = $self->{socket};
+    $self->_error( $ERROR_NO_CONNECTION, 'Attempt to work with a closed socket' ) if !$socket or $socket->destroyed;
 
-    my $started = Time::HiRes::time();
-    my $until = $started + $timeout;
-
-    my $error_code;
-    my $errno;
-    my $retries = 0;
-    my $interrupts = 0;
-    ATTEMPT: while ( $sent < $length && $retries++ < $MAX_RETRIES ) {
-        my $remaining_time = $until - Time::HiRes::time();
-        last ATTEMPT if $remaining_time <= 0; # timeout expired
-
-        undef $!;
-        my $can_write = $select->can_write( $remaining_time );
-        $errno = $!;
-        if ( $errno ) {
-            if ( $errno == EINTR ) {
-                undef $errno;
-                --$retries; # this attempt does not count
-                ++$interrupts;
-                next ATTEMPT;
-            }
-
-            $self->close;
-
-            last ATTEMPT;
-        }
-
-        if ( $can_write ) {
-            # check for EOF on the first attempt only
-            if ( $retries == 1 && $self->_is_close_wait ) {
-                $self->close;
-                $error_code = $ERROR_NO_CONNECTION;
-                last ATTEMPT;
-            }
-
-            undef $!;
-            my $wrote = CORE::send( $self->{socket}, $message, MSG_DONTWAIT );
-            $errno = $!;
-
-            if( defined $wrote && $wrote > 0 ) {
-                $sent += $wrote;
-                if ( $sent < $length ) {
-                    # remove written data from message
-                    $message = substr( $message, $wrote );
-                }
-            }
-
-            if( $errno ) {
-                if( $errno == EINTR ) {
-                    undef $errno;
-                    --$retries; # this attempt does not count
-                    ++$interrupts;
-                    next ATTEMPT;
-                } elsif (
-                           $errno != EAGAIN
-                        && $errno != EWOULDBLOCK
-                        ## on freebsd, if we got ECONNRESET, it's a timeout from the other side
-                        && !( $errno == ECONNRESET && $^O eq 'freebsd' )
-                    ) {
-                    $self->close;
-                    last ATTEMPT;
-                }
-            }
-
-            last ATTEMPT unless defined $wrote;
-        }
-    }
-
-    unless( !$errno && defined( $sent ) && $sent == $length )
-    {
+    $socket->wtimeout($timeout);
+    $socket->on_wtimeout(sub {
+        my ($h) = @_;
+        $self->close;
         $self->_error(
-            $error_code // $ERROR_CANNOT_SEND,
-            format_message( "Kafka::IO(%s)->send: ERRNO=%s ERROR='%s' (length=%s, sent=%s, timeout=%s, retries=%s, interrupts=%s, secs=%.6f)",
+            $ERROR_CANNOT_SEND,
+            format_message( "Kafka::IO::Async(%s)->send: ERROR='%s' (length=%s, timeout=%s)",
                 $self->{host},
-                ( $errno // 0 ) + 0,
-                ( $errno // '<none>' ) . '',
+                'Write timeout fired',
                 $length,
-                $sent,
                 $timeout,
-                $retries,
-                $interrupts,
-                Time::HiRes::time() - $started,
             )
         );
-    }
+    });
 
-    return $sent;
+    $socket->push_write($message);
+
+    return length($message);
 }
 
 =head3 C<< receive( $length <, $timeout> ) >>
@@ -404,117 +285,34 @@ sub receive {
     $self->_error( $ERROR_MISMATCH_ARGUMENT, '->receive' )
         unless $timeout > 0
     ;
-    my $select = $self->{_io_select};
-    $self->_error( $ERROR_NO_CONNECTION, 'Attempt to work with a closed socket' ) unless $select;
+    my $socket = $self->{socket};
+    $self->_error( $ERROR_NO_CONNECTION, 'Attempt to work with a closed socket' ) if !$socket or $socket->destroyed;
 
     my $message = '';
-    my $len_to_read = $length;
+    my $error;
+    my $cv = AnyEvent->condvar;
 
-    my $started = Time::HiRes::time();
-    my $until = $started + $timeout;
-
-    my $error_code;
-    my $errno;
-    my $retries = 0;
-    my $interrupts = 0;
-    ATTEMPT: while ( $len_to_read > 0 && $retries++ < $MAX_RETRIES ) {
-        my $remaining_time = $until - Time::HiRes::time();
-        last if $remaining_time <= 0; # timeout expired
-
-        undef $!;
-        my $can_read = $select->can_read( $remaining_time );
-        $errno = $!;
-        if ( $errno ) {
-            if ( $errno == EINTR ) {
-                undef $errno;
-                --$retries; # this attempt does not count
-                ++$interrupts;
-                next ATTEMPT;
-            }
-
-            $self->close;
-
-            last ATTEMPT;
-        }
-
-        if ( $can_read ) {
-            my $buf = '';
-            undef $!;
-            my $from_recv = CORE::recv( $self->{socket}, $buf, $len_to_read, MSG_DONTWAIT );
-            $errno = $!;
-
-            if ( defined( $from_recv ) && length( $buf ) ) {
-                $message .= $buf;
-                $len_to_read = $length - length( $message );
-                --$retries; # this attempt was successful, don't count as a retry
-            }
-            if ( $errno ) {
-                if ( $errno == EINTR ) {
-                    undef $errno;
-                    --$retries; # this attempt does not count
-                    ++$interrupts;
-                    next ATTEMPT;
-                } elsif (
-                           $errno != EAGAIN
-                        && $errno != EWOULDBLOCK
-                        ## on freebsd, if we got ECONNRESET, it's a timeout from the other side
-                        && !( $errno == ECONNRESET && $^O eq 'freebsd' )
-                    ) {
-                    $self->close;
-                    last ATTEMPT;
-                }
-            }
-
-            if ( length( $buf ) == 0 ) {
-                if( defined( $from_recv ) && ! $errno ) {
-                    # no error and nothing received with select returning "can read" means EOF: other side closed socket
-                    $self->_debug_msg( 'EOF on receive attempt, closing socket' )
-                        if $self->debug_level;
-                    $self->close;
-
-                    if( length( $message ) == 0 ) {
-                        # we did not receive anything yet, so we may (in some cases) reconnect and try again
-                        $error_code = $ERROR_NO_CONNECTION;
-                    }
-
-                    last ATTEMPT;
-                }
-                # we did not read anything on this attempt: wait a bit before the next one; should not happen, but just in case...
-                if ( my $remaining_attempts = $MAX_RETRIES - $retries ) {
-                    $remaining_time = $until - Time::HiRes::time();
-                    my $micro_seconds = int( $remaining_time * 1e6 / $remaining_attempts );
-                    if ( $micro_seconds > 0 ) {
-                        $micro_seconds = 250_000 if $micro_seconds > 250_000; # prevent long sleeps if total remaining time is big
-                        $self->_debug_msg( format_message( 'sleeping (remaining attempts %d, time %.6f): %d microseconds', $remaining_attempts, $remaining_time, $micro_seconds ) )
-                            if $self->debug_level;
-                        Time::HiRes::usleep( $micro_seconds );
-                    }
-                }
-            }
-        }
-    }
-
-    unless( !$errno && length( $message ) >= $length )
-    {
-        $self->_error(
-            $error_code // $ERROR_CANNOT_RECV,
-            format_message( "Kafka::IO(%s)->receive: ERRNO=%s ERROR='%s' (length=%s, received=%s, timeout=%s, retries=%s, interrupts=%s, secs=%.6f)",
-                $self->{host},
-                ( $errno // 0 ) + 0,
-                ( $errno // '<none>' ) . '',
-                $length,
-                length( $message ),
-                $timeout,
-                $retries,
-                $interrupts,
-                Time::HiRes::time() - $started,
-            ),
+    $socket->rtimeout($timeout);
+    $socket->on_rtimeout(sub {
+        my ($h) = @_;
+        $self->close;
+        $error = format_message( "Kafka::IO::Async(%s)->receive: ERROR='%s' (timeout=%s)",
+            $self->{host},
+            'Read timeout fired',
+            $timeout,
         );
-    }
-    $self->_debug_msg( $message, 'Response from', 'yellow' )
-        if $self->debug_level >= 2;
+        $cv->send;
+    });
 
-    # returns tainted data
+    $socket->push_read(chunk => $length, sub {
+        my ($h, $data) = @_;
+        $message = $data;
+        $cv->send;
+    });
+
+    $cv->recv;
+    die $error if $error;
+
     return \$message;
 }
 
@@ -529,41 +327,13 @@ sub close {
 
     my $ret = 1;
     if ( $self->{socket} ) {
-        $ret = CORE::close( $self->{socket} );
-        $self->{socket}     = undef;
-        $self->{_io_select} = undef;
+        $self->{socket}->destroy;
+        $self->{socket} = undef;
     }
 
     return $ret;
 }
 
-sub _is_close_wait {
-    my ( $self ) = @_;
-    return 1 unless $self->{socket} && $self->{_io_select}; # closed already
-    # http://stefan.buettcher.org/cs/conn_closed.html
-    # socket is open; check if we can read, and if we can but recv() cannot peek, it means we got EOF
-    return unless $self->{_io_select}->can_read( 0 ); # we cannot read, but may be able to write
-    my $buf = '';
-    undef $!;
-    my $status = CORE::recv( $self->{socket}, $buf, 1, MSG_DONTWAIT | MSG_PEEK ); # peek, do not remove data from queue
-    # EOF when there is no error, status is defined, but result is empty
-    return ! $! && defined $status && length( $buf ) == 0;
-}
-
-# The method verifies if we can connect to a Kafka broker.
-# This is evil: opens and immediately closes a NEW connection so do not use unless there is a strong reason for it.
-sub _is_alive {
-    my ( $self ) = @_;
-
-    my $socket = $self->{socket};
-    return unless $socket;
-
-    socket( my $tmp_socket, $self->{pf}, SOCK_STREAM, IPPROTO_TCP );
-    my $is_alive = connect( $tmp_socket, getpeername( $socket ) );
-    CORE::close( $tmp_socket );
-
-    return $is_alive;
-}
 
 #-- private attributes ---------------------------------------------------------
 
@@ -574,244 +344,53 @@ sub _is_alive {
 sub _connect {
     my ( $self ) = @_;
 
+    my $error;
     $self->{socket}     = undef;
-    $self->{_io_select} = undef;
 
     my $name    = $self->{host};
     my $port    = $self->{port};
     my $timeout = $self->{timeout};
 
-    my $ip = '';
-    if ( $self->_get_family( $name ) ) {
-        $ip = $self->{ip} = $name;
-    } else {
-        if ( defined $timeout ) {
-            my $remaining;
-            my $start = time();
+    my $cv = AnyEvent->condvar;
 
-            $self->_debug_msg( format_message( "name = '%s', number of wallclock seconds = %s", $name, ceil( $timeout ) ) )
-                if $self->debug_level;
-
-            # DNS lookup.
-            local $@;
-            my $h = set_sig_handler( 'ALRM', sub { die 'alarm clock restarted' },
-                {
-                    mask    => [ 'ALRM' ],
-                    safe    => 0,   # perl 5.8+ uses safe signal delivery so we need unsafe signal for timeout to work
-                }
+    my $connection = AnyEvent::Handle->new(
+        connect => [$name, $port],
+        ($timeout ? (on_prepare => sub { $timeout } ) : ()),
+        on_connect => sub {
+            my ($h, $host, $port, $retry) = @_;
+            $cv->send;
+        },
+        on_connect_error => sub {
+            my ($h, $message) = @_;
+            $error = format_message( "connect host = %s, port = %s: %s\n", $name, $port, $message );
+            $cv->send;
+        },
+        on_error => sub {
+            my ($h, $fatal, $message) = @_;
+            $self->close if $fatal;
+            $self->_error(
+                $ERROR_NO_CONNECTION,
+                format_message( "Kafka::IO::Async(%s)->handle: ERROR='%s' FATAL=%s",
+                    $self->{host},
+                    $message,
+                    $fatal,
+                )
             );
-            eval {
-                $remaining = alarm( ceil( $timeout ) );
-                $ip = $self->_gethostbyname( $name );
-                alarm 0;
-            };
-            alarm 0;                                # race condition protection
-            my $error = $@;
-            undef $h;
+        },
+        on_eof => sub {
+            my ($h) = @_;
+            $self->close;
+        },
+    );
 
-            $self->_debug_msg( format_message( "_connect: ip = '%s', error = '%s', \$? = %s, \$! = '%s'", $ip, $error, $?, $! ) )
-                if $self->debug_level;
+    $cv->recv;
 
-            die $error if $error;
-            die( format_message( "gethostbyname %s: \$? = '%s', \$! = '%s'\n", $name, $?, $! ) ) unless $ip;
-
-            my $elapsed = time() - $start;
-            # $SIG{ALRM} restored automatically, but we need to restart previous alarm manually
-
-            $self->_debug_msg( format_message( '_connect: %s (remaining) - %s (elapsed) = %s', $remaining, $elapsed, $remaining - $elapsed ) )
-                if $self->debug_level;
-            if ( $remaining ) {
-                if ( $remaining - $elapsed > 0 ) {
-                    $self->_debug_msg( '_connect: remaining - elapsed > 0 (to alarm restart)' )
-                        if $self->debug_level;
-                    alarm( ceil( $remaining - $elapsed ) );
-                } else {
-                    $self->_debug_msg( '_connect: remaining - elapsed < 0 (to alarm function call)' )
-                        if $self->debug_level;
-                    # $SIG{ALRM}->();
-                    kill ALRM => $$;
-                }
-                $self->_debug_msg( "_connect: after alarm 'recalled'" )
-                    if $self->debug_level;
-            }
-        } else {
-            $ip = $self->_gethostbyname( $name );
-            die( format_message( "could not resolve host name to IP address: %s\n", $name ) ) unless $ip;
-        }
-    }
-
-    # Create socket.
-    socket( my $connection, $self->{pf}, SOCK_STREAM, scalar getprotobyname( 'tcp' ) ) or die( "socket: $!\n" );
-
-    # Set autoflushing.
-    my $file_handle = select( $connection ); $| = 1; select $file_handle;
-
-    # Set FD_CLOEXEC.
-    my $flags = fcntl( $connection, F_GETFL, 0 ) or die "fcntl: $!\n";
-    fcntl( $connection, F_SETFL, $flags | FD_CLOEXEC ) or die "fnctl: $!\n";
-
-    $flags = fcntl( $connection, F_GETFL, 0 ) or die "fcntl F_GETFL: $!\n"; # 0 for error, 0e0 for 0.
-    fcntl( $connection, F_SETFL, $flags | O_NONBLOCK ) or die "fcntl F_SETFL O_NONBLOCK: $!\n"; # 0 for error, 0e0 for 0.
-
-    # Connect returns immediately because of O_NONBLOCK.
-    my $sockaddr = $self->{af} eq AF_INET
-        ? pack_sockaddr_in(  $port, inet_aton( $ip ) )
-        : pack_sockaddr_in6( $port, inet_pton( $self->{af}, $ip ) )
-    ;
-    connect( $connection, $sockaddr ) || $!{EINPROGRESS} || die( format_message( "connect ip = %s, port = %s: %s\n", $ip, $port, $! ) );
-
-    # Reset O_NONBLOCK.
-    $flags = fcntl( $connection, F_GETFL, 0 ) or die "fcntl F_GETFL: $!\n";  # 0 for error, 0e0 for 0.
-    fcntl( $connection, F_SETFL, $flags & ~ O_NONBLOCK ) or die "fcntl F_SETFL not O_NONBLOCK: $!\n";  # 0 for error, 0e0 for 0.
-
-    # Use select() to poll for completion or error. When connect succeeds we can write.
-    my $vec = '';
-    vec( $vec, fileno( $connection ), 1 ) = 1;
-    select( undef, $vec, undef, $timeout // $REQUEST_TIMEOUT );
-    unless ( vec( $vec, fileno( $connection ), 1 ) ) {
-        # If no response yet, impose our own timeout.
-        $! = ETIMEDOUT;
-        die( format_message( "connect ip = %s, port = %s: %s\n", $ip, $port, $! ) );
-    }
-
-    # This is how we see whether it connected or there was an error. Document Unix, are you kidding?!
-    $! = unpack( 'L', getsockopt( $connection, SOL_SOCKET, SO_ERROR ) );
-    die( format_message( "connect ip = %s, port = %s: %s\n", $ip, $port, $! ) ) if $!;
-
-    # Set timeout on all reads and writes.
-    #
-    # Note the difference between Perl's sysread() and read() calls: sysread()
-    # queries the kernel exactly once, with max delay specified here. read()
-    # queries the kernel repeatedly until there's a read error (such as this
-    # timeout), EOF, or a full buffer. So when using read() with a timeout of one
-    # second, if the remote server sends 1 byte repeatedly at 1 second intervals,
-    # read() will read the whole buffer very slowly and sysread() will return only
-    # the first byte. The print() and syswrite() calls are similarly different.
-    # <> is of course similar to read() but delimited by newlines instead of buffer
-    # sizes.
-    my $timeval = _get_timeval( $timeout // $REQUEST_TIMEOUT );
-    setsockopt( $connection, SOL_SOCKET, SO_SNDTIMEO, $timeval ) // die "setsockopt SOL_SOCKET, SO_SNDTIMEO: $!\n";
-    setsockopt( $connection, SOL_SOCKET, SO_RCVTIMEO, $timeval ) // die "setsockopt SOL_SOCKET, SO_RCVTIMEO: $!\n";
+    die $error if $error;
 
     $self->{socket} = $connection;
-    my $s = $self->{_io_select} = IO::Select->new;
-    $s->add( $self->{socket} );
-
     return $connection;
 }
 
-# Packing timeval
-# uses http://trinitum.org/wp/packing-timeval/
-sub _get_timeval {
-    my $timeout = shift;
-
-    my $intval = int( $timeout );                               # sec
-    my $fraction = int( ( $timeout - $intval ) * 1_000_000 );   # ms
-
-    if ( $Config{osname} eq 'netbsd' && _major_osvers() >= 6 && $Config{longsize} == 4 ) {
-        if ( defined $Config{use64bitint} ) {
-            $timeout = pack( 'QL', int( $timeout ), $fraction );
-        } else {
-            $timeout = pack(
-                'LLL',
-                (
-                    $Config{byteorder} eq '1234'
-                        ? ( $timeout, 0, $fraction )
-                        : ( 0, $timeout, $fraction )
-                )
-            );
-        }
-    } else {
-        $timeout = pack( 'L!L!', $timeout, $fraction );
-    }
-
-    return $timeout;
-}
-
-sub _major_osvers {
-    my $osvers = $Config{osvers};
-    my ( $major_osvers ) = $osvers =~ /^(\d+)/;
-    $major_osvers += 0;
-
-    return $major_osvers;
-}
-
-sub _gethostbyname {
-    my ( $self, $name ) = @_;
-
-    my $is_v4_fqdn = 1;
-    $self->{ip} = '';
-
-    my $ip_version = $self->{ip_version};
-    if ( defined( $ip_version ) && $ip_version == $IP_V6 ) {
-        my ( $err, @addrs ) = getaddrinfo(
-            $name,
-            '',     # not interested in the service name
-            {
-                family      => AF_INET6,
-                socktype    => SOCK_STREAM,
-                protocol    => IPPROTO_TCP,
-            },
-        );
-        return( $self->{ip} ) if $err;
-
-        $is_v4_fqdn = 0;
-        for my $addr ( @addrs ) {
-            my ( $err, $ipaddr ) = getnameinfo( $addr->{addr}, NI_NUMERICHOST, NIx_NOSERV );
-            next if $err;
-
-            $self->{af} = AF_INET6;
-            $self->{pf} = PF_INET6;
-            $self->{ip} = $ipaddr;
-            last;
-        }
-    }
-
-    if ( $is_v4_fqdn && ( !defined( $ip_version ) || $ip_version == $IP_V4 ) ) {
-        if ( my $ipaddr = gethostbyname( $name ) ) {
-            $self->{ip} = inet_ntop( $self->{af}, $ipaddr );
-        }
-    }
-
-    return $self->{ip};
-}
-
-sub _get_family {
-    my ( $self, $name ) = @_;
-
-    my $is_ip;
-    my $ip_version = $self->{ip_version} // 0;
-    if ( ( ( $is_ip = is_ipv6( $name ) ) && !$ip_version ) || $ip_version == $IP_V6 ) {
-        $self->_error( $ERROR_INCOMPATIBLE_HOST_IP_VERSION, format_message( 'ip_version = %s, host = %s', $ip_version, $name ) )
-            if
-                   $ip_version
-                && (
-                        ( !$is_ip && is_ipv4( $name ) )
-                    || ( $is_ip && $ip_version == $IP_V4 )
-                )
-        ;
-
-        $self->{af} = AF_INET6;
-        $self->{pf} = PF_INET6;
-    } elsif ( ( ( $is_ip = is_ipv4( $name ) ) && !$ip_version ) || $ip_version == $IP_V4 ) {
-        $self->_error( $ERROR_INCOMPATIBLE_HOST_IP_VERSION, format_message( 'ip_version = %s, host = %s', $ip_version, $name ) )
-            if
-                   $ip_version
-                && (
-                        ( !$is_ip && is_ipv6( $name ) )
-                    || ( $is_ip && $ip_version == $IP_V6 )
-                )
-        ;
-
-        $self->{af} = AF_INET;
-        $self->{pf} = PF_INET;
-    } elsif ( !$ip_version ) {
-        $self->{af} = AF_INET;
-        $self->{pf} = PF_INET;
-    }
-
-    return $is_ip;
-}
 
 # Show additional debugging information
 sub _debug_msg {
@@ -887,7 +466,7 @@ for the list of all available methods.
 Authors suggest using of L<Try::Tiny|Try::Tiny>'s C<try> and C<catch> to handle exceptions while
 working with L<Kafka|Kafka> package.
 
-Here is the list of possible error messages that C<Kafka::IO> may produce:
+Here is the list of possible error messages that C<Kafka::IO::Async> may produce:
 
 =over 3
 
@@ -897,7 +476,7 @@ Invalid arguments were passed to a method.
 
 =item C<Cannot send>
 
-Message cannot be sent on a C<Kafka::IO> object socket.
+Message cannot be sent on a C<Kafka::IO::Async> object socket.
 
 =item C<Cannot receive>
 
@@ -916,9 +495,9 @@ using one of the following ways:
 
 C<PERL_KAFKA_DEBUG=1>     - debug is enabled for the whole L<Kafka|Kafka> package.
 
-C<PERL_KAFKA_DEBUG=IO:1>  - enable debug for C<Kafka::IO> only.
+C<PERL_KAFKA_DEBUG=IO:1>  - enable debug for C<Kafka::IO::Async> only.
 
-C<Kafka::IO> supports two debug levels (level 2 includes debug output of 1):
+C<Kafka::IO::Async> supports two debug levels (level 2 includes debug output of 1):
 
 =over 3
 
@@ -953,7 +532,7 @@ protocol on 32 bit systems.
 L<Kafka::Protocol|Kafka::Protocol> - functions to process messages in the
 Apache Kafka's Protocol.
 
-L<Kafka::IO|Kafka::IO> - low-level interface for communication with Kafka server.
+L<Kafka::IO::Async|Kafka::IO::Async> - low-level interface for communication with Kafka server.
 
 L<Kafka::Exceptions|Kafka::Exceptions> - module designated to handle Kafka exceptions.
 
